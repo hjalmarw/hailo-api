@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# HEF model files (large binaries)
+*.hef
+*.pt
+
+# Logs
+*.log
+hailort*.log
+
+# Secrets / environment
+.env
+*.env
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# HIVE network config (contains agent IDs)
+HIVE-RULES.md
+
+# OS
+.DS_Store
+Thumbs.db
