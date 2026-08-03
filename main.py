@@ -200,15 +200,29 @@ class FaceIdentifyResponse(BaseModel):
     processing_ms: int
 
 
+class VideoStrategy(str, Enum):
+    """How frames are chosen for analysis."""
+    adaptive = "adaptive"  # motion-gate, track, embed only the best frames per person
+    uniform = "uniform"    # fixed stride, embed every face found
+
+
 class FaceVideoRequest(BaseModel):
     video: Optional[str] = Field(default=None, description="Base64-encoded video file")
     video_path: Optional[str] = Field(default=None, description="Path to a video file, restricted to allowed directories")
-    sample_every: int = Field(default=15, ge=1, le=300, description="Analyse every Nth frame")
-    max_frames: int = Field(default=600, ge=1, le=10000, description="Cap on frames analysed")
+    strategy: VideoStrategy = Field(default=VideoStrategy.adaptive, description="'adaptive' picks frames by motion and face quality; 'uniform' uses a fixed stride")
+    sample_every: int = Field(default=5, ge=1, le=300, description="Examine every Nth frame. With 'adaptive' this can be small — the motion gate does the real filtering.")
+    max_frames: int = Field(default=2000, ge=1, le=100000, description="Cap on frames examined")
     min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     match_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    min_face_pixels: float = Field(default=DEFAULT_MIN_FACE_PIXELS, ge=0)
+    min_face_pixels: float = Field(default=DEFAULT_MIN_FACE_PIXELS, ge=0, description="Reject faces below this area. The default (~110x110) is often too strict for cameras viewing at distance — check faces_rejected_small before concluding nobody was there.")
     blur_tolerance: float = Field(default=DEFAULT_BLUR_TOLERANCE, ge=0)
+    # Adaptive-only controls
+    motion_threshold: float = Field(default=2.0, ge=0.0, le=255.0, description="Mean pixel change needed to analyse a frame. 0 disables the motion gate.")
+    embeddings_per_track: int = Field(default=3, ge=1, le=10, description="How many of the best frames per person get embedded and voted on")
+    track_iou: float = Field(default=0.3, ge=0.0, le=1.0, description="Box overlap needed to treat a detection as the same person")
+    track_max_gap_s: float = Field(default=2.0, ge=0.0, le=60.0, description="Seconds of absence before a person is treated as a new appearance")
+    min_track_quality: float = Field(default=0.02, ge=0.0, le=1.0, description="Skip embedding appearances below this quality — a one-frame profile glance cannot be identified anyway. Set 0 to embed everything.")
+    include_crops: bool = Field(default=False, description="Return the best face crop per track as base64 JPEG")
 
 
 class PersonSighting(BaseModel):
@@ -219,11 +233,36 @@ class PersonSighting(BaseModel):
     last_seen_s: float
 
 
+class TrackResult(BaseModel):
+    track_id: int
+    name: Optional[str] = Field(default=None, description="Matched person, or null if nobody matched")
+    similarity: Optional[float] = None
+    votes: str = Field(..., description="How many of the embedded frames agreed, e.g. '3/3'")
+    detections: int = Field(..., description="Frames this person was detected in")
+    first_seen_s: float
+    last_seen_s: float
+    best_frame_s: float = Field(..., description="Timestamp of the highest-quality frame")
+    best_quality: float
+    sharpness: float
+    frontality: float = Field(..., description="1.0 = face-on, 0.0 = profile")
+    face_pixels: int
+    best_crop_jpeg_b64: Optional[str] = Field(default=None, description="Best face crop, if include_crops was set")
+
+
 class FaceVideoResponse(BaseModel):
+    strategy: str
     people: list[PersonSighting]
+    tracks: list[TrackResult] = Field(..., description="One entry per distinct appearance, including unmatched ones")
+    unknown_tracks: int = Field(..., description="Appearances by people who matched nobody enrolled")
     unknown_face_sightings: int
-    frames_sampled: int
+    unidentifiable_tracks: list[dict] = Field(default_factory=list, description="Appearances too low-quality to embed (e.g. a single profile glance). Reported rather than dropped, so a person passing through is never silently absent.")
+    frames_sampled: int = Field(..., description="Frames examined after the stride")
+    frames_skipped_no_motion: int = Field(..., description="Frames the motion gate discarded before any inference")
+    frames_analysed: int = Field(..., description="Frames that actually reached face detection")
     frames_with_faces: int
+    faces_rejected_small: int
+    faces_rejected_blurry: int
+    embeddings_computed: int = Field(..., description="ArcFace runs — the expensive operation")
     video_frames: int
     fps: float
     duration_s: Optional[float]
@@ -706,6 +745,13 @@ async def faces_identify_video(request: FaceVideoRequest):
                 match_threshold=request.match_threshold,
                 min_face_pixels=request.min_face_pixels,
                 blur_tolerance=request.blur_tolerance,
+                strategy=request.strategy.value,
+                motion_threshold=request.motion_threshold,
+                embeddings_per_track=request.embeddings_per_track,
+                track_iou=request.track_iou,
+                track_max_gap_s=request.track_max_gap_s,
+                min_track_quality=request.min_track_quality,
+                include_crops=request.include_crops,
             )
         except ValueError as e:
             return JSONResponse(status_code=400, content={"error": str(e)})
@@ -718,10 +764,19 @@ async def faces_identify_video(request: FaceVideoRequest):
             temp_path.unlink(missing_ok=True)
 
     return FaceVideoResponse(
+        strategy=result["strategy"],
         people=[PersonSighting(**p) for p in result["people"]],
+        tracks=[TrackResult(**t) for t in result["tracks"]],
+        unknown_tracks=result["unknown_tracks"],
         unknown_face_sightings=result["unknown_face_sightings"],
+        unidentifiable_tracks=result["unidentifiable_tracks"],
         frames_sampled=result["frames_sampled"],
+        frames_skipped_no_motion=result["frames_skipped_no_motion"],
+        frames_analysed=result["frames_analysed"],
         frames_with_faces=result["frames_with_faces"],
+        faces_rejected_small=result["faces_rejected_small"],
+        faces_rejected_blurry=result["faces_rejected_blurry"],
+        embeddings_computed=result["embeddings_computed"],
         video_frames=result["video_frames"],
         fps=result["fps"],
         duration_s=result["duration_s"],

@@ -52,27 +52,78 @@ curl -X POST http://localhost:8001/api/v1/faces/identify \
   -d "{\"image\": \"$IMAGE\"}"
 ```
 
-#### Example: identify people in a video
+#### Video: which frames get analysed
+
+Long footage is mostly nothing happening. Analysing every Nth frame wastes the NPU on
+an empty driveway and can still miss the one clear frame of someone's face. The default
+`adaptive` strategy addresses both:
+
+1. **Motion gate** — frames whose downscaled grey level barely differs from the previous
+   one are dropped before any inference. This is where most of the saving comes from.
+2. **Detect on survivors** — SCRFD runs only on frames that passed the gate.
+3. **Track and score** — detections are linked into tracks (box overlap, falling back to
+   centre proximity so a head turn doesn't split one person into three). Each detection
+   is scored on face size, sharpness, detection confidence and **frontality**, estimated
+   from where the nose sits between the eyes.
+4. **Embed only the winners** — ArcFace runs on the best few crops per track, and the
+   results vote. One unlucky frame cannot decide who someone is.
+
+Measured on 90s of synthetic driveway footage (faces present in 12% of frames):
+
+| | uniform | adaptive |
+|---|---|---|
+| Frames examined | 450 | 450 |
+| Skipped by motion gate | 0 | 392 |
+| Reached face detection | 450 | 58 |
+| **ArcFace runs** | **30** | **3** |
+| **Wall clock** | **17.9s** | **4.5s** |
+| People found | identical | identical |
+
+Cost tracks *how much happens* in the video rather than how long it is. On the dense
+demo montage — constant motion, nothing for the gate to skip — adaptive still wins on
+quality, cutting 39 fragmented tracks to 24 correct ones.
+
+Set `strategy: "uniform"` for a plain fixed-stride scan with per-frame counts.
+
 ```bash
 curl -X POST http://localhost:8001/api/v1/faces/identify_video \
   -H "Content-Type: application/json" \
-  -d '{"video_path": "/home/grazzy/media/front_door.mp4", "sample_every": 15}'
+  -d '{"video_path": "/mnt/rai-models/footage/front_door.mp4",
+       "sample_every": 3, "include_crops": true}'
 ```
 
-Returns per-person sightings rather than per-frame noise:
+Each track reports the appearance and its best frame:
 ```json
-{
-  "people": [
-    {"name": "Anna", "sightings": 9, "best_similarity": 0.982,
-     "first_seen_s": 15.83, "last_seen_s": 22.5}
-  ],
-  "unknown_face_sightings": 23,
-  "frames_sampled": 73, "duration_s": 60.63, "processing_ms": 6417
-}
+{"track_id": 0, "name": "Anna", "votes": "3/3", "detections": 30,
+ "first_seen_s": 20.0, "last_seen_s": 25.8, "best_frame_s": 23.2,
+ "frontality": 0.987, "face_pixels": 18042, "best_crop_jpeg_b64": "..."}
 ```
 
-`unknown_face_sightings` counts good-quality faces that matched nobody — so an
-unrecognised visitor still shows up rather than vanishing from the report.
+##### Video parameters
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `strategy` | `adaptive` | `adaptive` selects frames by motion and face quality; `uniform` uses a fixed stride |
+| `sample_every` | 5 | Examine every Nth frame. With `adaptive` this can be small — the motion gate does the real filtering. |
+| `motion_threshold` | 2.0 | Mean pixel change needed to analyse a frame. Raise for noisy sensors, set `0` to disable. |
+| `embeddings_per_track` | 3 | Best frames per person that get embedded and voted on |
+| `track_iou` | 0.3 | Box overlap treated as the same person |
+| `track_max_gap_s` | 2.0 | Absence before a person counts as a new appearance |
+| `min_track_quality` | 0.02 | Appearances below this are reported but not embedded — a one-frame profile glance can't be identified anyway |
+| `include_crops` | false | Return the best face crop per track as base64 JPEG |
+
+##### Reading the diagnostics
+
+`frames_skipped_no_motion`, `faces_rejected_small`, `faces_rejected_blurry` and
+`unidentifiable_tracks` exist so an empty result is never ambiguous. If nobody was
+found, these say whether the scene was empty, the faces were too far away, or the
+footage was too blurry.
+
+> **`min_face_pixels` is the parameter most likely to need tuning.** The 12000 default
+> (~110×110) suits doorbell-distance faces. A camera covering a driveway will produce
+> faces well below it — in testing, a face at 10598px was silently correct to reject by
+> the default and identified at 0.947 once the gate was lowered. **Check
+> `faces_rejected_small` before concluding nobody was there.**
 
 #### Tuning
 
@@ -81,7 +132,6 @@ unrecognised visitor still shows up rather than vanishing from the report.
 | `match_threshold` | 0.5 | Cosine similarity needed to claim a match. Measured separation on validation data was ~0.89 (same-person ≥0.93, different-person ≤0.04), so 0.5 sits in a wide empty band. Raise toward 0.7 to be stricter. |
 | `min_face_pixels` | 12000 | ≈110×110. Faces smaller than this are reported as `face_too_small`. |
 | `blur_tolerance` | 150 | Variance of Laplacian. Motion-blurred faces are reported as `too_blurry`. |
-| `sample_every` | 15 | Video only. Every Nth frame. Lower catches brief appearances at higher cost. |
 
 #### Notes
 

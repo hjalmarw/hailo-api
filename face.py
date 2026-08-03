@@ -122,6 +122,91 @@ def blur_score(face_bgr_or_rgb: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def frontality(landmarks: np.ndarray) -> float:
+    """Estimate how face-on a detection is, from 0.0 (profile) to 1.0 (frontal).
+
+    On a frontal face the nose sits midway between the eyes. As the head turns, the
+    nose shifts toward the near eye. Measuring that offset against the inter-eye
+    distance gives a cheap yaw proxy with no extra model — and it matters, because
+    ArcFace embeddings degrade sharply on profile views. Selecting a frontal frame over
+    a profile one is often the difference between a match and a miss.
+    """
+    points = np.asarray(landmarks, dtype=np.float32).reshape(5, 2)
+    left_eye, right_eye, nose = points[0], points[1], points[2]
+
+    eye_distance = float(np.linalg.norm(right_eye - left_eye))
+    if eye_distance < 1e-3:
+        return 0.0
+
+    eye_centre = (left_eye + right_eye) / 2.0
+    # Offset measured along the eye axis, so head roll doesn't masquerade as yaw.
+    axis = (right_eye - left_eye) / eye_distance
+    offset = abs(float(np.dot(nose - eye_centre, axis))) / eye_distance
+
+    # offset ~0 frontal; ~0.5 is roughly full profile.
+    return float(np.clip(1.0 - 2.0 * offset, 0.0, 1.0))
+
+
+def quality_score(area_px: float, sharpness: float, confidence: float,
+                  frontal: float) -> float:
+    """Rank a face detection by how likely it is to yield a correct identification.
+
+    Each term saturates: beyond a point, a bigger or sharper face adds nothing, so a
+    huge blurry profile shouldn't outrank a moderate crisp frontal one. Multiplying
+    rather than averaging means any single term near zero vetoes the frame — which is
+    the behaviour we want, since one fatal flaw ruins the embedding.
+    """
+    size_term = min(1.0, np.sqrt(max(area_px, 0.0)) / 160.0)   # saturates at ~160px
+    sharp_term = min(1.0, max(sharpness, 0.0) / 300.0)
+    return float(size_term * sharp_term * confidence * max(frontal, 0.05))
+
+
+def _box_iou(a: List[float], b: List[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+class _Track:
+    """One person's continuous appearance, keeping only the best crops seen.
+
+    Holding the top-K aligned crops rather than every frame bounds memory at a few
+    hundred KB per track regardless of video length, while still letting the expensive
+    embedding step choose from genuinely good candidates.
+    """
+
+    __slots__ = ("id", "last_box", "last_time", "first_time", "detections", "best")
+
+    def __init__(self, track_id: int, box: List[float], timestamp: float):
+        self.id = track_id
+        self.last_box = box
+        self.last_time = timestamp
+        self.first_time = timestamp
+        self.detections = 0
+        self.best: List[dict] = []   # sorted by score, highest first
+
+    def add(self, box: List[float], timestamp: float, crop: np.ndarray,
+            score: float, meta: dict, keep: int):
+        self.last_box = box
+        self.last_time = timestamp
+        self.detections += 1
+
+        if len(self.best) >= keep and score <= self.best[-1]["score"]:
+            return   # cheaper than inserting then trimming, and the common case
+
+        self.best.append({"score": score, "crop": crop, "timestamp": timestamp, **meta})
+        self.best.sort(key=lambda item: -item["score"])
+        del self.best[keep:]
+
+
 class _HailoModel:
     """Shared persistent-load plumbing for the two face models."""
 
@@ -624,16 +709,337 @@ def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5
 def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600,
                   min_confidence: float = 0.5, match_threshold: float = 0.5,
                   min_face_pixels: float = DEFAULT_MIN_FACE_PIXELS,
-                  blur_tolerance: float = DEFAULT_BLUR_TOLERANCE) -> dict:
-    """Identify people across a video by sampling every Nth frame.
+                  blur_tolerance: float = DEFAULT_BLUR_TOLERANCE,
+                  strategy: str = "adaptive",
+                  motion_threshold: float = 2.0,
+                  embeddings_per_track: int = 3,
+                  track_iou: float = 0.3,
+                  track_max_gap_s: float = 2.0,
+                  min_track_quality: float = 0.02,
+                  include_crops: bool = False) -> dict:
+    """Identify people across a video, choosing which frames are worth the NPU.
 
-    Rather than returning per-frame noise, sightings are aggregated per person: the
-    best similarity seen, how many frames they appeared in, and the timestamp window.
-    That is what "who was in this footage" actually means.
+    Two strategies:
 
-    Unknown faces that pass the quality gates are counted separately so an intruder
-    doesn't vanish just because they aren't enrolled.
+    `uniform` — analyse every Nth frame and embed every face found. Predictable, and
+    the right choice when you want raw per-frame counts.
+
+    `adaptive` (default) — the frame-selection problem done properly:
+
+      1. **Motion gate.** Security footage is mostly an empty driveway. Frames whose
+         downscaled grey level barely differs from the last are skipped before any
+         inference runs, which is where most of the saving comes from.
+      2. **Detect on survivors.** SCRFD runs on frames that passed the gate. This is
+         unavoidable — you cannot know a face is there without looking.
+      3. **Track and score.** Detections are linked into tracks by box overlap across
+         nearby frames, so one person walking through the shot is one track rather than
+         forty independent sightings. Each detection is scored on size, sharpness,
+         detection confidence and frontality.
+      4. **Embed only the winners.** ArcFace runs on the best few crops per track, not
+         every frame. Identification then votes across those, so a single unlucky frame
+         cannot decide who someone is.
+
+    The payoff is that cost scales with *how much happens* in the video rather than how
+    long it is, and identification quality goes up rather than down, because the frames
+    reaching ArcFace are chosen for suitability instead of by clock position.
     """
+    if strategy not in ("adaptive", "uniform"):
+        raise ValueError("strategy must be 'adaptive' or 'uniform'")
+
+    if strategy == "uniform":
+        return _analyze_video_uniform(
+            video_path, sample_every, max_frames, min_confidence, match_threshold,
+            min_face_pixels, blur_tolerance,
+        )
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    detector = get_face_detector()
+
+    tracks: List[_Track] = []
+    active: List[_Track] = []
+    next_track_id = 0
+
+    previous_grey = None
+    frame_index = 0
+    frames_examined = 0
+    frames_skipped_motion = 0
+    frames_detected = 0
+    frames_with_faces = 0
+    rejected_small = 0
+    rejected_blurry = 0
+
+    start = time.perf_counter()
+    try:
+        while frames_examined < max_frames:
+            if not capture.grab():
+                break
+
+            if frame_index % sample_every != 0:
+                frame_index += 1
+                continue
+
+            ok, frame_bgr = capture.retrieve()
+            frame_index += 1
+            if not ok:
+                break
+
+            frames_examined += 1
+            timestamp = (frame_index - 1) / fps if fps else 0.0
+
+            # --- 1. motion gate -------------------------------------------------
+            grey = cv2.cvtColor(
+                cv2.resize(frame_bgr, (160, 90), interpolation=cv2.INTER_AREA),
+                cv2.COLOR_BGR2GRAY,
+            )
+            if previous_grey is not None:
+                movement = float(np.mean(cv2.absdiff(grey, previous_grey)))
+                if movement < motion_threshold:
+                    previous_grey = grey
+                    frames_skipped_motion += 1
+                    continue
+            previous_grey = grey
+
+            # --- 2. detect ------------------------------------------------------
+            image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            faces = detector.detect(
+                Image.fromarray(image_rgb), min_confidence=min_confidence
+            )
+            frames_detected += 1
+            if faces:
+                frames_with_faces += 1
+
+            # Retire tracks nobody has contributed to recently.
+            active = [t for t in active if timestamp - t.last_time <= track_max_gap_s]
+
+            for face in faces:
+                if face["area_px"] < min_face_pixels:
+                    rejected_small += 1
+                    continue
+
+                aligned = align_face(
+                    image_rgb, np.array(face["landmarks"], dtype=np.float32)
+                )
+                sharpness = blur_score(aligned)
+                if sharpness < blur_tolerance:
+                    rejected_blurry += 1
+                    continue
+
+                # --- 3. track and score -------------------------------------
+                facing = frontality(face["landmarks"])
+                score = quality_score(
+                    face["area_px"], sharpness, face["confidence"], facing
+                )
+
+                matched = None
+                best_overlap = track_iou
+                for track in active:
+                    overlap = _box_iou(track.last_box, face["bbox"])
+                    if overlap >= best_overlap:
+                        best_overlap = overlap
+                        matched = track
+
+                # IoU alone fragments badly: a person turning their head shifts the box
+                # enough to drop below threshold, splitting one appearance into several
+                # tracks. Fall back to centre proximity, which survives that.
+                if matched is None:
+                    box = face["bbox"]
+                    centre = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+                    width = max(box[2] - box[0], 1.0)
+                    closest = None
+                    for track in active:
+                        last = track.last_box
+                        last_centre = ((last[0] + last[2]) / 2.0, (last[1] + last[3]) / 2.0)
+                        distance = np.hypot(centre[0] - last_centre[0],
+                                            centre[1] - last_centre[1])
+                        if distance < width and (closest is None or distance < closest[0]):
+                            closest = (distance, track)
+                    if closest is not None:
+                        matched = closest[1]
+
+                if matched is None:
+                    matched = _Track(next_track_id, face["bbox"], timestamp)
+                    next_track_id += 1
+                    tracks.append(matched)
+                    active.append(matched)
+
+                matched.add(
+                    face["bbox"], timestamp, aligned, score,
+                    {
+                        "sharpness": round(sharpness, 1),
+                        "frontality": round(facing, 3),
+                        "face_pixels": int(face["area_px"]),
+                        "detection_confidence": round(face["confidence"], 4),
+                    },
+                    keep=embeddings_per_track,
+                )
+    finally:
+        capture.release()
+
+    # --- 4. embed only the selected crops ------------------------------------
+    embedder = get_face_embedder()
+    gallery = get_gallery()
+
+    track_results = []
+    embeddings_computed = 0
+    low_quality_tracks = []
+
+    for track in tracks:
+        if not track.best:
+            continue
+
+        # Don't spend an embedding on a face ArcFace cannot do anything with — a
+        # single-frame profile glance scores near zero and would only ever come back
+        # "unknown". These are still reported, as "seen but not identifiable", so a
+        # person passing through doesn't disappear from the results entirely.
+        if track.best[0]["score"] < min_track_quality:
+            low_quality_tracks.append({
+                "track_id": track.id,
+                "detections": track.detections,
+                "first_seen_s": round(track.first_time, 2),
+                "last_seen_s": round(track.last_time, 2),
+                "best_quality": round(track.best[0]["score"], 4),
+                "frontality": track.best[0]["frontality"],
+                "face_pixels": track.best[0]["face_pixels"],
+                "reason": "quality_below_threshold",
+            })
+            continue
+
+        votes: dict = {}
+        best_overall = None
+
+        for candidate in track.best:
+            vector = embedder.embed(candidate["crop"])
+            embeddings_computed += 1
+            match = gallery.identify(vector, threshold=match_threshold)
+
+            name = match["name"] if match else None
+            similarity = match["similarity"] if match else 0.0
+
+            record = votes.setdefault(name, {"count": 0, "best_similarity": 0.0})
+            record["count"] += 1
+            record["best_similarity"] = max(record["best_similarity"], similarity)
+
+            if best_overall is None or similarity > best_overall["similarity"]:
+                best_overall = {
+                    "similarity": similarity,
+                    "timestamp": candidate["timestamp"],
+                    "sharpness": candidate["sharpness"],
+                    "frontality": candidate["frontality"],
+                    "face_pixels": candidate["face_pixels"],
+                    "quality": round(candidate["score"], 4),
+                    "crop": candidate["crop"],
+                }
+
+        # Majority of the sampled crops decides identity; ties break on similarity.
+        winner, tally = max(
+            votes.items(), key=lambda kv: (kv[1]["count"], kv[1]["best_similarity"])
+        )
+
+        entry = {
+            "track_id": track.id,
+            "name": winner,
+            "similarity": round(tally["best_similarity"], 4) if winner else None,
+            "votes": f"{tally['count']}/{len(track.best)}",
+            "detections": track.detections,
+            "first_seen_s": round(track.first_time, 2),
+            "last_seen_s": round(track.last_time, 2),
+            "best_frame_s": round(best_overall["timestamp"], 2),
+            "best_quality": best_overall["quality"],
+            "sharpness": best_overall["sharpness"],
+            "frontality": best_overall["frontality"],
+            "face_pixels": best_overall["face_pixels"],
+        }
+
+        if include_crops:
+            ok, buffer = cv2.imencode(
+                ".jpg", cv2.cvtColor(best_overall["crop"], cv2.COLOR_RGB2BGR)
+            )
+            if ok:
+                import base64 as _b64
+                entry["best_crop_jpeg_b64"] = _b64.b64encode(buffer.tobytes()).decode()
+
+        track_results.append(entry)
+
+    # Identity is a stronger signal than geometry: if two consecutive tracks resolve to
+    # the same person within the gap window, they were one appearance that the tracker
+    # split. Merging here recovers what box-overlap could not.
+    track_results.sort(key=lambda t: t["first_seen_s"])
+    merged: List[dict] = []
+    for entry in track_results:
+        previous = next(
+            (m for m in reversed(merged)
+             if m["name"] is not None and m["name"] == entry["name"]
+             and entry["first_seen_s"] - m["last_seen_s"] <= track_max_gap_s),
+            None,
+        )
+        if previous is None:
+            merged.append(entry)
+            continue
+
+        previous["detections"] += entry["detections"]
+        previous["last_seen_s"] = max(previous["last_seen_s"], entry["last_seen_s"])
+        previous["merged_tracks"] = previous.get("merged_tracks", 1) + 1
+        if entry["best_quality"] > previous["best_quality"]:
+            for field in ("best_frame_s", "best_quality", "sharpness", "frontality",
+                          "face_pixels", "similarity", "best_crop_jpeg_b64"):
+                if field in entry:
+                    previous[field] = entry[field]
+    track_results = merged
+
+    # Collapse tracks into people: the same person may appear several times.
+    people: dict = {}
+    for entry in track_results:
+        if entry["name"] is None:
+            continue
+        record = people.setdefault(entry["name"], {
+            "name": entry["name"],
+            "sightings": 0,
+            "best_similarity": 0.0,
+            "first_seen_s": entry["first_seen_s"],
+            "last_seen_s": entry["last_seen_s"],
+        })
+        record["sightings"] += entry["detections"]
+        record["best_similarity"] = max(record["best_similarity"], entry["similarity"])
+        record["first_seen_s"] = min(record["first_seen_s"], entry["first_seen_s"])
+        record["last_seen_s"] = max(record["last_seen_s"], entry["last_seen_s"])
+
+    for record in people.values():
+        record["best_similarity"] = round(record["best_similarity"], 4)
+
+    unknown_tracks = [t for t in track_results if t["name"] is None]
+
+    return {
+        "strategy": "adaptive",
+        "people": sorted(people.values(), key=lambda p: -p["sightings"]),
+        "tracks": sorted(track_results, key=lambda t: t["first_seen_s"]),
+        "unknown_tracks": len(unknown_tracks),
+        "unknown_face_sightings": sum(t["detections"] for t in unknown_tracks),
+        "unidentifiable_tracks": low_quality_tracks,
+        "frames_sampled": frames_examined,
+        "frames_skipped_no_motion": frames_skipped_motion,
+        "frames_analysed": frames_detected,
+        "frames_with_faces": frames_with_faces,
+        "faces_rejected_small": rejected_small,
+        "faces_rejected_blurry": rejected_blurry,
+        "embeddings_computed": embeddings_computed,
+        "video_frames": total_frames,
+        "fps": round(fps, 2),
+        "duration_s": round(total_frames / fps, 2) if fps and total_frames else None,
+        "processing_ms": int((time.perf_counter() - start) * 1000),
+        "truncated": frames_examined >= max_frames,
+    }
+
+
+def _analyze_video_uniform(video_path: str, sample_every: int, max_frames: int,
+                           min_confidence: float, match_threshold: float,
+                           min_face_pixels: float, blur_tolerance: float) -> dict:
+    """Fixed-stride scan: embed every face in every Nth frame."""
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
         raise ValueError(f"Could not open video: {video_path}")
@@ -650,8 +1056,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
     start = time.perf_counter()
     try:
         while frames_processed < max_frames:
-            ok = capture.grab()
-            if not ok:
+            if not capture.grab():
                 break
 
             if frame_index % sample_every != 0:
@@ -708,10 +1113,19 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
         record["best_similarity"] = round(record["best_similarity"], 4)
 
     return {
+        "strategy": "uniform",
         "people": sorted(people.values(), key=lambda p: -p["sightings"]),
+        "tracks": [],
+        "unknown_tracks": 0,
         "unknown_face_sightings": unknown_sightings,
+        "unidentifiable_tracks": [],
         "frames_sampled": frames_processed,
+        "frames_skipped_no_motion": 0,
+        "frames_analysed": frames_processed,
         "frames_with_faces": frames_with_faces,
+        "faces_rejected_small": 0,
+        "faces_rejected_blurry": 0,
+        "embeddings_computed": sum(p["sightings"] for p in people.values()),
         "video_frames": total_frames,
         "fps": round(fps, 2),
         "duration_s": round(total_frames / fps, 2) if fps and total_frames else None,
