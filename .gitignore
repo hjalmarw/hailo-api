@@ -30,3 +30,6 @@ HIVE-RULES.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Face recognition gallery — biometric data, never commit
+face_gallery/

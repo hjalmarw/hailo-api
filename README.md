@@ -19,6 +19,82 @@ FastAPI-based object detection and speech-to-text API for Raspberry Pi 5 with Ha
 - Supports variants: `tiny`, `tiny.en`, `base`, `base.en`
 - Runs on CPU via HuggingFace transformers (~2s for short clips on Pi 5)
 
+### Face Recognition (`/api/v1/faces/*`)
+- Identify known people in images or video, on the NPU
+- Two-stage pipeline: SCRFD-10G face detection with 5 landmarks → similarity-transform
+  alignment to a canonical 112×112 crop → ArcFace/MobileFaceNet 512-d embedding
+- Enrolled people are stored as embeddings and matched by cosine similarity
+- Quality gates reject faces that are too small or too motion-blurred to judge, and say
+  which gate they failed rather than silently dropping them
+- Video mode aggregates sightings per person — who appeared, how often, and when
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/faces/enroll` | Add a person from a photo containing exactly one face |
+| `POST /api/v1/faces/identify` | Find and name every face in an image |
+| `POST /api/v1/faces/identify_video` | Identify people across a video |
+| `GET /api/v1/faces/persons` | List enrolled people |
+| `DELETE /api/v1/faces/persons/{name}` | Remove a person and all their embeddings |
+
+#### Example: enroll and identify
+```bash
+# Enroll — call repeatedly with different photos of the same person.
+# Varied lighting and angle measurably improve recognition on camera footage.
+IMAGE=$(base64 -w0 alice.jpg)
+curl -X POST http://localhost:8001/api/v1/faces/enroll \
+  -H "Content-Type: application/json" \
+  -d "{\"name\": \"Alice\", \"image\": \"$IMAGE\"}"
+
+# Identify
+IMAGE=$(base64 -w0 doorbell.jpg)
+curl -X POST http://localhost:8001/api/v1/faces/identify \
+  -H "Content-Type: application/json" \
+  -d "{\"image\": \"$IMAGE\"}"
+```
+
+#### Example: identify people in a video
+```bash
+curl -X POST http://localhost:8001/api/v1/faces/identify_video \
+  -H "Content-Type: application/json" \
+  -d '{"video_path": "/home/grazzy/media/front_door.mp4", "sample_every": 15}'
+```
+
+Returns per-person sightings rather than per-frame noise:
+```json
+{
+  "people": [
+    {"name": "Anna", "sightings": 9, "best_similarity": 0.982,
+     "first_seen_s": 15.83, "last_seen_s": 22.5}
+  ],
+  "unknown_face_sightings": 23,
+  "frames_sampled": 73, "duration_s": 60.63, "processing_ms": 6417
+}
+```
+
+`unknown_face_sightings` counts good-quality faces that matched nobody — so an
+unrecognised visitor still shows up rather than vanishing from the report.
+
+#### Tuning
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `match_threshold` | 0.5 | Cosine similarity needed to claim a match. Measured separation on validation data was ~0.89 (same-person ≥0.93, different-person ≤0.04), so 0.5 sits in a wide empty band. Raise toward 0.7 to be stricter. |
+| `min_face_pixels` | 12000 | ≈110×110. Faces smaller than this are reported as `face_too_small`. |
+| `blur_tolerance` | 150 | Variance of Laplacian. Motion-blurred faces are reported as `too_blurry`. |
+| `sample_every` | 15 | Video only. Every Nth frame. Lower catches brief appearances at higher cost. |
+
+#### Notes
+
+- **Enrollment refuses images containing more than one face.** Silently picking one is
+  how the wrong person's embedding ends up attached to a name.
+- **`video_path` is restricted to an allowlist** (`ALLOWED_VIDEO_DIRS` in `main.py`).
+  The API has no authentication, so an unrestricted path would be an arbitrary file
+  read for anyone on the LAN.
+- **The gallery is biometric data.** It lives in `face_gallery/` and is gitignored.
+  Treat it accordingly.
+- Recognition is ~65ms per image end to end (detect + align + embed + match) on a
+  720p frame; video runs ~88ms per sampled frame including decode.
+
 ### Other Endpoints
 - `GET /api/v1/health` — Health check with device and model status
 - `GET /api/v1/models` — List all available detection and whisper models
@@ -89,6 +165,7 @@ curl -X POST http://localhost:8001/api/v1/transcribe \
 - **`main.py`** — FastAPI application with all endpoints
 - **`detector.py`** — Hailo-10H object detection with model caching, tiling, OBB support
 - **`transcriber.py`** — Whisper speech-to-text via HuggingFace transformers (CPU)
+- **`face.py`** — SCRFD face detection, ArcFace embedding, and the enrolled-person gallery
 - **`coco_labels.py`** — COCO-80 label definitions
 
 ## Limitations

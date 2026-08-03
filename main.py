@@ -2,8 +2,11 @@
 
 import base64
 import io
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from enum import Enum
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -21,6 +24,11 @@ from detector import (
 from coco_labels import COCO_LABELS
 from transcriber import (
     get_transcriber, close_transcriber, list_whisper_models, audio_bytes_to_numpy
+)
+import face as face_module
+from face import (
+    analyze_image, analyze_video, enroll_from_image, get_gallery, close_face_models,
+    DEFAULT_MIN_FACE_PIXELS, DEFAULT_BLUR_TOLERANCE,
 )
 
 
@@ -149,12 +157,97 @@ class TranscribeResponse(BaseModel):
     audio_duration_s: float
 
 
+class FaceEnrollRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Person's name")
+    image: str = Field(..., description="Base64-encoded image containing exactly one face")
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="Face detection threshold")
+
+
+class FaceEnrollResponse(BaseModel):
+    name: str
+    detection_confidence: float
+    sharpness: float
+    face_pixels: int
+    total_embeddings: int
+
+
+class FaceIdentifyRequest(BaseModel):
+    image: str = Field(..., description="Base64-encoded JPG or PNG image")
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="Face detection threshold")
+    match_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="Cosine similarity needed to claim a match")
+    min_face_pixels: float = Field(default=DEFAULT_MIN_FACE_PIXELS, ge=0, description="Reject faces smaller than this area in pixels")
+    blur_tolerance: float = Field(default=DEFAULT_BLUR_TOLERANCE, ge=0, description="Reject faces blurrier than this (variance of Laplacian)")
+    identify: bool = Field(default=True, description="Set false to detect faces without matching against the gallery")
+
+
+class FaceResult(BaseModel):
+    bbox: list[float] = Field(..., description="[x_min, y_min, x_max, y_max] in original image pixels")
+    detection_confidence: float
+    landmarks: list[list[float]] = Field(..., description="5 points: eyes, nose, mouth corners")
+    name: Optional[str] = Field(default=None, description="Matched person, or null if unknown")
+    similarity: Optional[float] = Field(default=None, description="Cosine similarity to the matched person")
+    sharpness: Optional[float] = None
+    skipped: Optional[str] = Field(default=None, description="Why this face was not identified")
+
+
+class FaceIdentifyResponse(BaseModel):
+    faces: list[FaceResult]
+    detected: int
+    recognized: int
+    too_small: int
+    too_blurry: int
+    image_size: ImageSize
+    processing_ms: int
+
+
+class FaceVideoRequest(BaseModel):
+    video: Optional[str] = Field(default=None, description="Base64-encoded video file")
+    video_path: Optional[str] = Field(default=None, description="Path to a video file, restricted to allowed directories")
+    sample_every: int = Field(default=15, ge=1, le=300, description="Analyse every Nth frame")
+    max_frames: int = Field(default=600, ge=1, le=10000, description="Cap on frames analysed")
+    min_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    match_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    min_face_pixels: float = Field(default=DEFAULT_MIN_FACE_PIXELS, ge=0)
+    blur_tolerance: float = Field(default=DEFAULT_BLUR_TOLERANCE, ge=0)
+
+
+class PersonSighting(BaseModel):
+    name: str
+    sightings: int
+    best_similarity: float
+    first_seen_s: float
+    last_seen_s: float
+
+
+class FaceVideoResponse(BaseModel):
+    people: list[PersonSighting]
+    unknown_face_sightings: int
+    frames_sampled: int
+    frames_with_faces: int
+    video_frames: int
+    fps: float
+    duration_s: Optional[float]
+    processing_ms: int
+    truncated: bool = Field(..., description="True if max_frames stopped the scan before the end")
+
+
+class PersonEntry(BaseModel):
+    name: str
+    embeddings: int
+
+
+class PersonsResponse(BaseModel):
+    persons: list[PersonEntry]
+    count: int
+
+
 class HealthResponse(BaseModel):
     status: str
     model: str
     device: str
     uptime_seconds: int
     whisper: Optional[str] = Field(default=None, description="Whisper model status")
+    faces: Optional[str] = Field(default=None, description="Face gallery status")
 
 
 class LabelsResponse(BaseModel):
@@ -183,7 +276,8 @@ async def lifespan(app: FastAPI):
     # Cleanup
     close_all_detectors()
     close_transcriber()
-    print("All detectors and transcribers closed")
+    close_face_models()
+    print("All detectors, transcribers and face models closed")
 
 
 app = FastAPI(
@@ -326,12 +420,23 @@ async def health():
     whisper_models = list_whisper_models()
     whisper_status = f"available ({', '.join(whisper_models)})" if whisper_models else "no models"
 
+    # Report the gallery without touching the NPU — health must stay cheap and must not
+    # fail just because the face models have not been loaded on demand yet.
+    try:
+        persons = get_gallery().persons()
+        face_status = (f"{len(persons)} enrolled "
+                       f"({sum(p['embeddings'] for p in persons)} embeddings)"
+                       if persons else "gallery empty")
+    except Exception as e:
+        face_status = f"unavailable: {e}"
+
     return HealthResponse(
         status="ok",
         model=f"{detector.model_name}-hailo10",
         device="hailo10",
         uptime_seconds=detector.uptime_seconds,
         whisper=whisper_status,
+        faces=face_status,
     )
 
 
@@ -362,7 +467,10 @@ async def models():
     # Whisper speech-to-text models
     whisper_models = [f"whisper-{v}" for v in list_whisper_models()]
 
-    all_models = available + obb_models + hailo_obb_models + whisper_models
+    # Face pipeline models, exposed so callers can see the full capability surface
+    face_models = ["scrfd_10g-face-detect", "arcface_mobilefacenet-face-embed"]
+
+    all_models = available + obb_models + hailo_obb_models + whisper_models + face_models
     return ModelsResponse(
         models=all_models,
         current=get_current_model(),
@@ -453,6 +561,193 @@ async def transcribe(request: TranscribeRequest):
         processing_ms=processing_ms,
         audio_duration_s=audio_duration_s,
     )
+
+
+# Directories that /faces/identify_video may read from. The API has no authentication,
+# so an unrestricted path parameter would hand any host on the LAN an arbitrary file
+# read. Extend this list deliberately rather than removing the check.
+ALLOWED_VIDEO_DIRS = [
+    Path("/home/grazzy/media"),
+    Path("/home/grazzy/projects/hailo-api/videos"),
+    Path("/usr/local/hailo/resources/videos"),
+    Path("/mnt"),
+]
+
+
+def resolve_video_path(raw_path: str) -> Path:
+    """Resolve a caller-supplied video path, refusing anything outside the allowlist."""
+    candidate = Path(raw_path).resolve()
+    for allowed in ALLOWED_VIDEO_DIRS:
+        try:
+            if candidate.is_relative_to(allowed.resolve()):
+                break
+        except (OSError, ValueError):
+            continue
+    else:
+        raise ValueError(
+            f"Path not permitted. Allowed roots: {', '.join(str(d) for d in ALLOWED_VIDEO_DIRS)}"
+        )
+
+    if not candidate.is_file():
+        raise ValueError(f"No such file: {candidate}")
+    return candidate
+
+
+@app.post("/api/v1/faces/enroll",
+          response_model=FaceEnrollResponse,
+          responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}})
+async def faces_enroll(request: FaceEnrollRequest):
+    """Add a person to the recognition gallery from a photo containing one face.
+
+    Call repeatedly with different photos of the same name to improve robustness —
+    varied lighting and angle materially improve recognition on camera footage.
+    """
+    try:
+        image = Image.open(io.BytesIO(base64.b64decode(request.image)))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Invalid image data: {e}"})
+
+    try:
+        result = enroll_from_image(request.name, image, min_confidence=request.min_confidence)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except RuntimeError as e:
+        if "busy" in str(e).lower():
+            return JSONResponse(status_code=503, content={"error": "Hailo device busy - try again shortly"})
+        return JSONResponse(status_code=503, content={"error": str(e)})
+
+    total = sum(p["embeddings"] for p in get_gallery().persons() if p["name"] == request.name)
+    return FaceEnrollResponse(**result, total_embeddings=total)
+
+
+@app.post("/api/v1/faces/identify",
+          response_model=FaceIdentifyResponse,
+          responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}})
+async def faces_identify(request: FaceIdentifyRequest):
+    """Detect every face in an image and match each against the enrolled gallery.
+
+    Faces failing a quality gate are still returned, carrying a `skipped` reason, so a
+    caller can tell "nobody was there" apart from "the face was too small to judge".
+    """
+    try:
+        image = Image.open(io.BytesIO(base64.b64decode(request.image)))
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Invalid image data: {e}"})
+
+    width, height = image.size
+    start = time.perf_counter()
+
+    try:
+        faces, stats = analyze_image(
+            image,
+            min_confidence=request.min_confidence,
+            match_threshold=request.match_threshold,
+            min_face_pixels=request.min_face_pixels,
+            blur_tolerance=request.blur_tolerance,
+            identify=request.identify,
+        )
+    except RuntimeError as e:
+        if "busy" in str(e).lower():
+            return JSONResponse(status_code=503, content={"error": "Hailo device busy - try again shortly"})
+        return JSONResponse(status_code=500, content={"error": f"Face analysis failed: {e}"})
+
+    return FaceIdentifyResponse(
+        faces=[FaceResult(**f) for f in faces],
+        detected=stats["detected"],
+        recognized=stats["recognized"],
+        too_small=stats["too_small"],
+        too_blurry=stats["too_blurry"],
+        image_size=ImageSize(width=width, height=height),
+        processing_ms=int((time.perf_counter() - start) * 1000),
+    )
+
+
+@app.post("/api/v1/faces/identify_video",
+          response_model=FaceVideoResponse,
+          responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}})
+async def faces_identify_video(request: FaceVideoRequest):
+    """Identify people across a video, aggregating sightings per person.
+
+    Supply either `video` (base64) or `video_path` (a file under an allowed root).
+    Results are per-person rather than per-frame: how often someone appeared, their
+    best match confidence, and the window they were visible in.
+    """
+    if not request.video and not request.video_path:
+        return JSONResponse(status_code=400, content={"error": "Provide either 'video' or 'video_path'"})
+    if request.video and request.video_path:
+        return JSONResponse(status_code=400, content={"error": "Provide only one of 'video' or 'video_path'"})
+
+    temp_path = None
+    try:
+        if request.video_path:
+            try:
+                path = resolve_video_path(request.video_path)
+            except ValueError as e:
+                return JSONResponse(status_code=400, content={"error": str(e)})
+        else:
+            try:
+                data = base64.b64decode(request.video)
+            except Exception as e:
+                return JSONResponse(status_code=400, content={"error": f"Invalid base64 video: {e}"})
+            handle = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            handle.write(data)
+            handle.close()
+            temp_path = Path(handle.name)
+            path = temp_path
+
+        try:
+            result = analyze_video(
+                str(path),
+                sample_every=request.sample_every,
+                max_frames=request.max_frames,
+                min_confidence=request.min_confidence,
+                match_threshold=request.match_threshold,
+                min_face_pixels=request.min_face_pixels,
+                blur_tolerance=request.blur_tolerance,
+            )
+        except ValueError as e:
+            return JSONResponse(status_code=400, content={"error": str(e)})
+        except RuntimeError as e:
+            if "busy" in str(e).lower():
+                return JSONResponse(status_code=503, content={"error": "Hailo device busy - try again shortly"})
+            return JSONResponse(status_code=500, content={"error": f"Video analysis failed: {e}"})
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    return FaceVideoResponse(
+        people=[PersonSighting(**p) for p in result["people"]],
+        unknown_face_sightings=result["unknown_face_sightings"],
+        frames_sampled=result["frames_sampled"],
+        frames_with_faces=result["frames_with_faces"],
+        video_frames=result["video_frames"],
+        fps=result["fps"],
+        duration_s=result["duration_s"],
+        processing_ms=result["processing_ms"],
+        truncated=result["truncated"],
+    )
+
+
+@app.get("/api/v1/faces/persons", response_model=PersonsResponse)
+async def faces_persons():
+    """List everyone enrolled in the gallery and how many embeddings each has."""
+    persons = get_gallery().persons()
+    return PersonsResponse(
+        persons=[PersonEntry(**p) for p in persons],
+        count=len(persons),
+    )
+
+
+@app.delete("/api/v1/faces/persons/{name}",
+            responses={404: {"model": ErrorResponse}})
+async def faces_delete_person(name: str):
+    """Remove a person and all their embeddings from the gallery."""
+    removed = get_gallery().delete(name)
+    if removed == 0:
+        return JSONResponse(status_code=404, content={"error": f"No person named '{name}' in the gallery"})
+    return {"name": name, "removed_embeddings": removed}
 
 
 if __name__ == "__main__":
