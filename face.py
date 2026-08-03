@@ -792,12 +792,22 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
             frames_examined += 1
             timestamp = (frame_index - 1) / fps if fps else 0.0
 
+            # Retire tracks nobody has contributed to recently. Done before the motion
+            # gate, because whether anyone is currently in shot decides whether the
+            # gate is allowed to skip this frame at all.
+            active = [t for t in active if timestamp - t.last_time <= track_max_gap_s]
+
             # --- 1. motion gate -------------------------------------------------
             grey = cv2.cvtColor(
                 cv2.resize(frame_bgr, (160, 90), interpolation=cv2.INTER_AREA),
                 cv2.COLOR_BGR2GRAY,
             )
-            if previous_grey is not None:
+            if previous_grey is not None and not active:
+                # Only skip while nobody is being tracked. Skipping mid-appearance
+                # starves the tracker: the person keeps walking during the gap, the
+                # next detection lands too far away to associate, and one person
+                # shatters into a track per frame. Once someone is in shot, sample
+                # densely — that is when the frames are worth having.
                 movement = float(np.mean(cv2.absdiff(grey, previous_grey)))
                 if movement < motion_threshold:
                     previous_grey = grey
@@ -813,9 +823,6 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
             frames_detected += 1
             if faces:
                 frames_with_faces += 1
-
-            # Retire tracks nobody has contributed to recently.
-            active = [t for t in active if timestamp - t.last_time <= track_max_gap_s]
 
             for face in faces:
                 if face["area_px"] < min_face_pixels:
@@ -857,7 +864,12 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
                         last_centre = ((last[0] + last[2]) / 2.0, (last[1] + last[3]) / 2.0)
                         distance = np.hypot(centre[0] - last_centre[0],
                                             centre[1] - last_centre[1])
-                        if distance < width and (closest is None or distance < closest[0]):
+                        # Allow more travel the longer it has been since the track was
+                        # last seen — someone walking covers real ground between
+                        # samples, and a fixed radius mistakes that for a new person.
+                        gap = max(timestamp - track.last_time, 0.0)
+                        allowance = width * (1.0 + 4.0 * gap)
+                        if distance < allowance and (closest is None or distance < closest[0]):
                             closest = (distance, track)
                     if closest is not None:
                         matched = closest[1]
