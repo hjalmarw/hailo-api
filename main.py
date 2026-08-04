@@ -183,6 +183,7 @@ class FaceIdentifyRequest(BaseModel):
     blur_tolerance: float = Field(default=DEFAULT_BLUR_TOLERANCE, ge=0, description="Reject faces blurrier than this (variance of Laplacian)")
     identify: bool = Field(default=True, description="Set false to detect faces without matching against the gallery")
     min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. With adaface_ir50 on real footage: margin>=0.20 gives 95.4% precision at 58.8% coverage; margin>=0.30 gives 100% at 43%. 0 disables.")
+    tiling: Optional[bool] = Field(default=None, description="Tile detection over native-resolution crops instead of one downscaled frame. SCRFD sees a 640x640 letterbox, so on high-res footage faces vanish: measured on 2560x1920 clips, tiling took usable faces from 0 to 12 and from 5 to 23. null = automatic (on at >=1600px wide).")
     model: Optional[str] = Field(default=None, description="Embedding model. 'adaface_ir50' (default) measured 88.9% on real camera footage vs 66.0% for 'mobilefacenet'; mobilefacenet runs on the NPU at ~2ms vs ~213ms CPU, so use it only for per-frame realtime. Embeddings are NOT comparable across models — enrol and identify with the same one.")
 
 
@@ -234,6 +235,7 @@ class FaceVideoRequest(BaseModel):
     track_iou: float = Field(default=0.3, ge=0.0, le=1.0, description="Box overlap needed to treat a detection as the same person")
     track_max_gap_s: float = Field(default=2.0, ge=0.0, le=60.0, description="Seconds of absence before a person is treated as a new appearance")
     min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. With adaface_ir50: 0.20 -> 95.4% precision at 58.8% coverage; 0.30 -> 100% at 43%.")
+    tiling: Optional[bool] = Field(default=None, description="Tile detection over native-resolution crops instead of one downscaled frame. SCRFD sees a 640x640 letterbox, so on high-res footage faces vanish: measured on 2560x1920 clips, tiling took usable faces from 0 to 12 and from 5 to 23. null = automatic (on at >=1600px wide).")
     model: Optional[str] = Field(default=None, description="Embedding model. 'adaface_ir50' (default) measured 88.9% on real camera footage vs 66.0% for 'mobilefacenet'; mobilefacenet runs on the NPU at ~2ms vs ~213ms CPU, so use it only for per-frame realtime. Embeddings are NOT comparable across models — enrol and identify with the same one.")
     min_track_quality: float = Field(default=0.02, ge=0.0, le=1.0, description="Skip embedding appearances below this quality — a one-frame profile glance cannot be identified anyway. Set 0 to embed everything.")
     include_crops: bool = Field(default=False, description="Return the best face crop per track as base64 JPEG")
@@ -709,6 +711,7 @@ async def faces_identify(request: FaceIdentifyRequest):
             identify=request.identify,
             min_margin=request.min_margin,
             model=request.model,
+            tiling=request.tiling,
         )
     except RuntimeError as e:
         if "busy" in str(e).lower():
@@ -777,6 +780,7 @@ async def faces_identify_video(request: FaceVideoRequest):
                 min_track_quality=request.min_track_quality,
                 min_margin=request.min_margin,
                 model=request.model,
+                tiling=request.tiling,
                 include_crops=request.include_crops,
             )
         except ValueError as e:

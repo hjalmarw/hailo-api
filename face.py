@@ -55,6 +55,12 @@ ARCFACE_TEMPLATE = np.array([
     [70.7299, 92.2041],   # right mouth corner
 ], dtype=np.float32)
 
+# Above this width, detection is tiled by default. SCRFD sees a 640x640 letterbox, so
+# beyond roughly 2x that the downscale starts destroying faces outright.
+TILING_WIDTH_THRESHOLD = 1600
+TILE_SIZE = 960
+TILE_OVERLAP = 0.2
+
 # Quality gates, mirroring the tolerances Hailo ships in face_recon_algo_params.json.
 DEFAULT_MIN_FACE_PIXELS = 12000     # ~110x110; below this recognition degrades sharply
 DEFAULT_BLUR_TOLERANCE = 150.0      # variance of Laplacian
@@ -411,6 +417,71 @@ class FaceDetector(_HailoModel):
             np.concatenate(all_kps, axis=0),
         )
 
+    def detect_tiled(self, image: Image.Image, min_confidence: float = 0.5,
+                     iou_threshold: float = 0.4, tile: int = TILE_SIZE,
+                     overlap: float = TILE_OVERLAP) -> List[dict]:
+        """Detect faces over overlapping native-resolution tiles.
+
+        On high-resolution footage this finds faces the whole-frame path cannot see at
+        all: a 2560x1920 frame letterboxed to 640 shrinks a 60px face to ~15px. Measured
+        on real clips, tiling took one from 0 usable faces to 12, and another from 5 to
+        23.
+
+        Tiles overlap so a face straddling a boundary is whole in at least one tile;
+        duplicates are then merged by NMS in full-frame coordinates.
+        """
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        width, height = image.size
+        step = max(1, int(tile * (1.0 - overlap)))
+        collected = []
+
+        for top in range(0, max(1, height), step):
+            for left in range(0, max(1, width), step):
+                right, bottom = min(left + tile, width), min(top + tile, height)
+                if right - left < 64 or bottom - top < 64:
+                    continue
+                patch = image.crop((left, top, right, bottom))
+                for face in self.detect(patch, min_confidence=min_confidence,
+                                        iou_threshold=iou_threshold):
+                    box = face["bbox"]
+                    collected.append({
+                        "bbox": [box[0] + left, box[1] + top,
+                                 box[2] + left, box[3] + top],
+                        "confidence": face["confidence"],
+                        "landmarks": [[x + left, y + top]
+                                      for x, y in face["landmarks"]],
+                        "area_px": face["area_px"],
+                    })
+                # Stop scanning right once the tile already reaches the frame edge.
+                if right >= width:
+                    break
+            if bottom >= height:
+                break
+
+        if not collected:
+            return []
+
+        boxes = np.array([f["bbox"] for f in collected], dtype=np.float32)
+        scores = np.array([f["confidence"] for f in collected], dtype=np.float32)
+        return [collected[i] for i in _nms(boxes, scores, iou_threshold)]
+
+    def detect_auto(self, image: Image.Image, min_confidence: float = 0.5,
+                    iou_threshold: float = 0.4,
+                    tiling: Optional[bool] = None) -> List[dict]:
+        """Detect, tiling automatically on large frames.
+
+        `tiling=None` decides from frame width; True/False forces it.
+        """
+        use_tiles = (image.size[0] >= TILING_WIDTH_THRESHOLD
+                     if tiling is None else tiling)
+        if use_tiles:
+            return self.detect_tiled(image, min_confidence=min_confidence,
+                                     iou_threshold=iou_threshold)
+        return self.detect(image, min_confidence=min_confidence,
+                           iou_threshold=iou_threshold)
+
     def detect(self, image: Image.Image, min_confidence: float = 0.5,
                iou_threshold: float = 0.4) -> List[dict]:
         """Detect faces. Returns boxes and landmarks in the ORIGINAL image's pixels."""
@@ -752,7 +823,8 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
                   blur_tolerance: float = DEFAULT_BLUR_TOLERANCE,
                   identify: bool = True,
                   min_margin: float = 0.0,
-                  model: Optional[str] = None) -> Tuple[List[dict], dict]:
+                  model: Optional[str] = None,
+                  tiling: Optional[bool] = None) -> Tuple[List[dict], dict]:
     """Detect, align, embed and optionally identify every face in one image.
 
     Returns (faces, stats). Faces failing a quality gate are still returned with their
@@ -763,7 +835,8 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
         image = image.convert("RGB")
 
     detector = get_face_detector()
-    detections = detector.detect(image, min_confidence=min_confidence)
+    detections = detector.detect_auto(image, min_confidence=min_confidence,
+                                      tiling=tiling)
 
     image_rgb = np.array(image)
     embedder, model_name = resolve_embedder(model) if identify else (None, None)
@@ -837,7 +910,7 @@ def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5
         image = image.convert("RGB")
 
     detector = get_face_detector()
-    faces = detector.detect(image, min_confidence=min_confidence)
+    faces = detector.detect_auto(image, min_confidence=min_confidence)
 
     if not faces:
         raise ValueError("No face found in the image")
@@ -881,6 +954,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
                   min_track_quality: float = 0.02,
                   min_margin: float = 0.0,
                   model: Optional[str] = None,
+                  tiling: Optional[bool] = None,
                   include_crops: bool = False) -> dict:
     """Identify people across a video, choosing which frames are worth the NPU.
 
@@ -982,8 +1056,9 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
 
             # --- 2. detect ------------------------------------------------------
             image_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            faces = detector.detect(
-                Image.fromarray(image_rgb), min_confidence=min_confidence
+            faces = detector.detect_auto(
+                Image.fromarray(image_rgb), min_confidence=min_confidence,
+                tiling=tiling
             )
             frames_detected += 1
             if faces:
