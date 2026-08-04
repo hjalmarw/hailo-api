@@ -168,6 +168,7 @@ class FaceEnrollResponse(BaseModel):
     detection_confidence: float
     sharpness: float
     face_pixels: int
+    quality: float = Field(default=1.0, description="How much this face weighs in the person's centroid. Low-quality enrolments still count, but pull the average less.")
     total_embeddings: int
 
 
