@@ -474,8 +474,14 @@ class FaceDetector(_HailoModel):
 
         `tiling=None` decides from frame width; True/False forces it.
         """
-        use_tiles = (image.size[0] >= TILING_WIDTH_THRESHOLD
-                     if tiling is None else tiling)
+        # Default OFF. Measured: tiling raised one clip from 19 to 771 "faces", but a
+        # random sample of those crops was almost entirely a terracotta flower pot.
+        # SCRFD false-positives on it, and quality_score cannot tell - the pot is large,
+        # sharp and geometrically frontal, scoring 0.14-0.28, squarely in real-face
+        # range. Accuracy collapsed accordingly: adaface_ir18 94.8% -> 70.3%, and
+        # coverage at 100% precision went 71.3% -> 0.0%.
+        # Opt in explicitly with tiling=True where you can tolerate the false positives.
+        use_tiles = False if tiling is None else tiling
         if use_tiles:
             return self.detect_tiled(image, min_confidence=min_confidence,
                                      iou_threshold=iou_threshold)
