@@ -27,6 +27,14 @@ from PIL import Image
 
 from hailo_platform import HEF, VDevice, FormatType, HailoSchedulingAlgorithm
 
+import embedders
+
+# The default embedder. AdaFace IR-50 measured 88.9% against mobilefacenet's 66.0% on
+# real camera footage across 3 identities, and cut fold-to-fold variance from +/-9.9%
+# to +/-2.9%. It runs on CPU at ~213ms/face, which is immaterial for event-triggered
+# identification. Set to embedders.MOBILEFACENET for per-frame realtime on the NPU.
+DEFAULT_EMBEDDER = embedders.ADAFACE_IR50
+
 MODELS_DIR = Path("/usr/local/hailo/resources/models/hailo10h")
 SCRFD_PATH = MODELS_DIR / "scrfd_10g.hef"
 ARCFACE_PATH = MODELS_DIR / "arcface_mobilefacenet.hef"
@@ -485,7 +493,8 @@ class FaceGallery:
         self._names: List[str] = []
         self._vectors = np.empty((0, 512), dtype=np.float32)
         self._meta: List[dict] = []
-        self._centroid_cache: Optional[Tuple[List[str], np.ndarray]] = None
+        # keyed by model name — one centroid set per embedder
+        self._centroid_cache: Optional[dict] = None
         self._load()
 
     def _load(self):
@@ -516,28 +525,41 @@ class FaceGallery:
         ))
 
     def add(self, name: str, vector: np.ndarray, source: Optional[str] = None,
-            quality: float = 1.0):
+            quality: float = 1.0, model: str = "mobilefacenet"):
         with self._lock:
             self._names.append(name)
             self._meta.append({"source": source, "added_at": time.time(),
-                               "quality": float(quality)})
+                               "quality": float(quality), "model": model})
             self._vectors = np.vstack([self._vectors, vector.reshape(1, -1)])
             self._centroid_cache = None
             self._save()
 
-    def _centroids(self) -> Tuple[List[str], np.ndarray]:
+    def _model_of(self, index: int) -> str:
+        """Which embedder produced entry `index`.
+
+        Entries enrolled before models were tracked are mobilefacenet by definition —
+        that was the only embedder at the time.
+        """
+        if index < len(self._meta):
+            return self._meta[index].get("model") or "mobilefacenet"
+        return "mobilefacenet"
+
+    def _centroids(self, model: str = "mobilefacenet") -> Tuple[List[str], np.ndarray]:
         """Per-person mean embedding, renormalised to the unit sphere.
 
         Cached until the gallery changes — recomputing per frame would dominate the
         cost of matching once a gallery has any size.
         """
-        if self._centroid_cache is not None:
-            return self._centroid_cache
+        cached = self._centroid_cache.get(model) if self._centroid_cache else None
+        if cached is not None:
+            return cached
 
-        names = sorted(set(self._names))
+        names = sorted({n for i, n in enumerate(self._names)
+                        if self._model_of(i) == model})
         rows = []
         for name in names:
-            index = [i for i, n in enumerate(self._names) if n == name]
+            index = [i for i, n in enumerate(self._names)
+                     if n == name and self._model_of(i) == model]
             vectors = self._vectors[index]
 
             # Weight each embedding by the quality of the face it came from. A plain
@@ -559,13 +581,17 @@ class FaceGallery:
             norm = np.linalg.norm(centre)
             rows.append(centre / norm if norm > 0 else centre)
 
-        self._centroid_cache = (names, np.stack(rows) if rows
-                                else np.empty((0, 512), dtype=np.float32))
-        return self._centroid_cache
+        result = (names, np.stack(rows) if rows
+                  else np.empty((0, 512), dtype=np.float32))
+        if self._centroid_cache is None:
+            self._centroid_cache = {}
+        self._centroid_cache[model] = result
+        return result
 
     def identify(self, vector: np.ndarray, threshold: float = 0.5,
                  strategy: str = "centroid",
-                 min_margin: float = 0.0) -> Optional[dict]:
+                 min_margin: float = 0.0,
+                 model: str = "mobilefacenet") -> Optional[dict]:
         """Return the best-matching enrolled person above `threshold`, else None.
 
         Both sides are unit-norm, so a dot product is cosine similarity directly.
@@ -590,10 +616,17 @@ class FaceGallery:
             probe = vector.reshape(-1)
 
             if strategy == "centroid":
-                names, matrix = self._centroids()
+                names, matrix = self._centroids(model)
+                if len(names) == 0:
+                    return None
                 scores = matrix @ probe
             else:
-                names, scores = self._names, self._vectors @ probe
+                index = [i for i in range(len(self._names))
+                         if self._model_of(i) == model]
+                if not index:
+                    return None
+                names = [self._names[i] for i in index]
+                scores = self._vectors[index] @ probe
 
             order = np.argsort(scores)[::-1]
             best = int(order[0])
@@ -627,12 +660,19 @@ class FaceGallery:
             "margin": round(margin, 4) if margin is not None else None,
         }
 
-    def persons(self) -> List[dict]:
+    def persons(self, model: Optional[str] = None) -> List[dict]:
+        """Enrolled people. Without `model`, counts across every embedder."""
         with self._lock:
-            counts = {}
-            for name in self._names:
+            counts, models = {}, {}
+            for i, name in enumerate(self._names):
+                entry_model = self._model_of(i)
+                if model is not None and entry_model != model:
+                    continue
                 counts[name] = counts.get(name, 0) + 1
-            return [{"name": n, "embeddings": c} for n, c in sorted(counts.items())]
+                models.setdefault(name, set()).add(entry_model)
+            return [{"name": n, "embeddings": c,
+                     "models": sorted(models[n])}
+                    for n, c in sorted(counts.items())]
 
     def delete(self, name: str) -> int:
         """Remove every embedding for a person. Returns how many were removed."""
@@ -687,6 +727,7 @@ def get_gallery() -> FaceGallery:
 
 
 def close_face_models():
+    embedders.close_adaface()
     global _detector, _embedder
     with _init_lock:
         if _detector is not None:
@@ -697,12 +738,21 @@ def close_face_models():
             _embedder = None
 
 
+def resolve_embedder(model: Optional[str] = None):
+    """Return (embedder, model_name) for the requested backend."""
+    name = model or DEFAULT_EMBEDDER
+    if name == embedders.MOBILEFACENET:
+        return get_face_embedder(), embedders.MOBILEFACENET
+    return embedders.get_adaface(name), name
+
+
 def analyze_image(image: Image.Image, min_confidence: float = 0.5,
                   match_threshold: float = 0.5,
                   min_face_pixels: float = DEFAULT_MIN_FACE_PIXELS,
                   blur_tolerance: float = DEFAULT_BLUR_TOLERANCE,
                   identify: bool = True,
-                  min_margin: float = 0.0) -> Tuple[List[dict], dict]:
+                  min_margin: float = 0.0,
+                  model: Optional[str] = None) -> Tuple[List[dict], dict]:
     """Detect, align, embed and optionally identify every face in one image.
 
     Returns (faces, stats). Faces failing a quality gate are still returned with their
@@ -716,7 +766,7 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
     detections = detector.detect(image, min_confidence=min_confidence)
 
     image_rgb = np.array(image)
-    embedder = get_face_embedder() if identify else None
+    embedder, model_name = resolve_embedder(model) if identify else (None, None)
     gallery = get_gallery() if identify else None
 
     results = []
@@ -752,7 +802,7 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
 
         vector = embedder.embed(aligned)
         match = gallery.identify(vector, threshold=match_threshold,
-                                 min_margin=min_margin)
+                                 min_margin=min_margin, model=model_name)
         if match:
             entry["name"] = match["name"]
             entry["similarity"] = round(match["similarity"], 4)
@@ -762,7 +812,8 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
             entry["name"] = None
             # Distinguish "matched nobody" from "matched, but not confidently enough".
             if min_margin > 0.0:
-                ungated = gallery.identify(vector, threshold=match_threshold)
+                ungated = gallery.identify(vector, threshold=match_threshold,
+                                           model=model_name)
                 if ungated is not None:
                     entry["abstained"] = True
                     entry["best_guess"] = ungated["name"]
@@ -775,7 +826,8 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
 
 
 def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5,
-                      source: Optional[str] = None) -> dict:
+                      source: Optional[str] = None,
+                      model: Optional[str] = None) -> dict:
     """Enroll the single largest face in an image under `name`.
 
     Deliberately refuses images containing more than one face: silently picking one
@@ -803,8 +855,9 @@ def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5
     quality = quality_score(face["area_px"], sharpness, face["confidence"],
                             frontality(face["landmarks"]))
 
-    vector = get_face_embedder().embed(aligned)
-    get_gallery().add(name, vector, source=source, quality=quality)
+    embedder, model_name = resolve_embedder(model)
+    vector = embedder.embed(aligned)
+    get_gallery().add(name, vector, source=source, quality=quality, model=model_name)
 
     return {
         "name": name,
@@ -812,6 +865,7 @@ def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5
         "sharpness": round(sharpness, 1),
         "face_pixels": int(face["area_px"]),
         "quality": round(quality, 4),
+        "model": model_name,
     }
 
 
@@ -826,6 +880,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
                   track_max_gap_s: float = 2.0,
                   min_track_quality: float = 0.02,
                   min_margin: float = 0.0,
+                  model: Optional[str] = None,
                   include_crops: bool = False) -> dict:
     """Identify people across a video, choosing which frames are worth the NPU.
 
@@ -859,7 +914,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
     if strategy == "uniform":
         return _analyze_video_uniform(
             video_path, sample_every, max_frames, min_confidence, match_threshold,
-            min_face_pixels, blur_tolerance, min_margin,
+            min_face_pixels, blur_tolerance, min_margin, model,
         )
 
     capture = cv2.VideoCapture(video_path)
@@ -1004,7 +1059,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
         capture.release()
 
     # --- 4. embed only the selected crops ------------------------------------
-    embedder = get_face_embedder()
+    embedder, model_name = resolve_embedder(model)
     gallery = get_gallery()
 
     track_results = []
@@ -1039,7 +1094,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
             vector = embedder.embed(candidate["crop"])
             embeddings_computed += 1
             match = gallery.identify(vector, threshold=match_threshold,
-                                     min_margin=min_margin)
+                                     min_margin=min_margin, model=model_name)
 
             name = match["name"] if match else None
             similarity = match["similarity"] if match else 0.0
@@ -1139,6 +1194,7 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
 
     return {
         "strategy": "adaptive",
+        "model": model_name,
         "people": sorted(people.values(), key=lambda p: -p["sightings"]),
         "tracks": sorted(track_results, key=lambda t: t["first_seen_s"]),
         "unknown_tracks": len(unknown_tracks),
@@ -1162,7 +1218,8 @@ def analyze_video(video_path: str, sample_every: int = 15, max_frames: int = 600
 def _analyze_video_uniform(video_path: str, sample_every: int, max_frames: int,
                            min_confidence: float, match_threshold: float,
                            min_face_pixels: float, blur_tolerance: float,
-                           min_margin: float = 0.0) -> dict:
+                           min_margin: float = 0.0,
+                           model: Optional[str] = None) -> dict:
     """Fixed-stride scan: embed every face in every Nth frame."""
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
@@ -1203,6 +1260,8 @@ def _analyze_video_uniform(video_path: str, sample_every: int, max_frames: int,
                 min_face_pixels=min_face_pixels,
                 blur_tolerance=blur_tolerance,
                 identify=True,
+                min_margin=min_margin,
+                model=model,
             )
 
             if faces:
@@ -1238,6 +1297,7 @@ def _analyze_video_uniform(video_path: str, sample_every: int, max_frames: int,
 
     return {
         "strategy": "uniform",
+        "model": model or DEFAULT_EMBEDDER,
         "people": sorted(people.values(), key=lambda p: -p["sightings"]),
         "tracks": [],
         "unknown_tracks": 0,

@@ -28,8 +28,9 @@ from transcriber import (
 import face as face_module
 from face import (
     analyze_image, analyze_video, enroll_from_image, get_gallery, close_face_models,
-    DEFAULT_MIN_FACE_PIXELS, DEFAULT_BLUR_TOLERANCE,
+    DEFAULT_MIN_FACE_PIXELS, DEFAULT_BLUR_TOLERANCE, DEFAULT_EMBEDDER,
 )
+import embedders
 
 
 class PreprocessingType(str, Enum):
@@ -161,6 +162,7 @@ class FaceEnrollRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Person's name")
     image: str = Field(..., description="Base64-encoded image containing exactly one face")
     min_confidence: float = Field(default=0.5, ge=0.0, le=1.0, description="Face detection threshold")
+    model: Optional[str] = Field(default=None, description="Embedding model. 'adaface_ir50' (default) measured 88.9% on real camera footage vs 66.0% for 'mobilefacenet'; mobilefacenet runs on the NPU at ~2ms vs ~213ms CPU, so use it only for per-frame realtime. Embeddings are NOT comparable across models — enrol and identify with the same one.")
 
 
 class FaceEnrollResponse(BaseModel):
@@ -169,6 +171,7 @@ class FaceEnrollResponse(BaseModel):
     sharpness: float
     face_pixels: int
     quality: float = Field(default=1.0, description="How much this face weighs in the person's centroid. Low-quality enrolments still count, but pull the average less.")
+    model: str = Field(default="", description="Which embedder produced this embedding")
     total_embeddings: int
 
 
@@ -179,7 +182,8 @@ class FaceIdentifyRequest(BaseModel):
     min_face_pixels: float = Field(default=DEFAULT_MIN_FACE_PIXELS, ge=0, description="Reject faces smaller than this area in pixels")
     blur_tolerance: float = Field(default=DEFAULT_BLUR_TOLERANCE, ge=0, description="Reject faces blurrier than this (variance of Laplacian)")
     identify: bool = Field(default=True, description="Set false to detect faces without matching against the gallery")
-    min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. On real camera footage 0.2 lifted precision from 76.6% to 94.3%, at the cost of answering less often. 0 disables.")
+    min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. With adaface_ir50 on real footage: margin>=0.20 gives 95.4% precision at 58.8% coverage; margin>=0.30 gives 100% at 43%. 0 disables.")
+    model: Optional[str] = Field(default=None, description="Embedding model. 'adaface_ir50' (default) measured 88.9% on real camera footage vs 66.0% for 'mobilefacenet'; mobilefacenet runs on the NPU at ~2ms vs ~213ms CPU, so use it only for per-frame realtime. Embeddings are NOT comparable across models — enrol and identify with the same one.")
 
 
 class FaceResult(BaseModel):
@@ -229,7 +233,8 @@ class FaceVideoRequest(BaseModel):
     embeddings_per_track: int = Field(default=3, ge=1, le=10, description="How many of the best frames per person get embedded and voted on")
     track_iou: float = Field(default=0.3, ge=0.0, le=1.0, description="Box overlap needed to treat a detection as the same person")
     track_max_gap_s: float = Field(default=2.0, ge=0.0, le=60.0, description="Seconds of absence before a person is treated as a new appearance")
-    min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. 0.2 measured 94.3% precision on real footage vs 76.6% ungated.")
+    min_margin: float = Field(default=0.0, ge=0.0, le=1.0, description="Abstain unless the best match leads the runner-up by this much. With adaface_ir50: 0.20 -> 95.4% precision at 58.8% coverage; 0.30 -> 100% at 43%.")
+    model: Optional[str] = Field(default=None, description="Embedding model. 'adaface_ir50' (default) measured 88.9% on real camera footage vs 66.0% for 'mobilefacenet'; mobilefacenet runs on the NPU at ~2ms vs ~213ms CPU, so use it only for per-frame realtime. Embeddings are NOT comparable across models — enrol and identify with the same one.")
     min_track_quality: float = Field(default=0.02, ge=0.0, le=1.0, description="Skip embedding appearances below this quality — a one-frame profile glance cannot be identified anyway. Set 0 to embed everything.")
     include_crops: bool = Field(default=False, description="Return the best face crop per track as base64 JPEG")
 
@@ -260,6 +265,7 @@ class TrackResult(BaseModel):
 
 class FaceVideoResponse(BaseModel):
     strategy: str
+    model: str = Field(default="", description="Embedder used for this run")
     people: list[PersonSighting]
     tracks: list[TrackResult] = Field(..., description="One entry per distinct appearance, including unmatched ones")
     unknown_tracks: int = Field(..., description="Appearances by people who matched nobody enrolled")
@@ -282,6 +288,7 @@ class FaceVideoResponse(BaseModel):
 class PersonEntry(BaseModel):
     name: str
     embeddings: int
+    models: list[str] = Field(default_factory=list, description="Embedders this person is enrolled under. Identification only works with a model listed here.")
 
 
 class PersonsResponse(BaseModel):
@@ -516,7 +523,10 @@ async def models():
     whisper_models = [f"whisper-{v}" for v in list_whisper_models()]
 
     # Face pipeline models, exposed so callers can see the full capability surface
-    face_models = ["scrfd_10g-face-detect", "arcface_mobilefacenet-face-embed"]
+    face_models = ["scrfd_10g-face-detect"] + [
+        f"{m}-face-embed" + ("-default" if m == DEFAULT_EMBEDDER else "")
+        for m in embedders.available_embedders()
+    ]
 
     all_models = available + obb_models + hailo_obb_models + whisper_models + face_models
     return ModelsResponse(
@@ -656,7 +666,9 @@ async def faces_enroll(request: FaceEnrollRequest):
         return JSONResponse(status_code=400, content={"error": f"Invalid image data: {e}"})
 
     try:
-        result = enroll_from_image(request.name, image, min_confidence=request.min_confidence)
+        result = enroll_from_image(request.name, image,
+                                   min_confidence=request.min_confidence,
+                                   model=request.model)
     except ValueError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
     except RuntimeError as e:
@@ -696,6 +708,7 @@ async def faces_identify(request: FaceIdentifyRequest):
             blur_tolerance=request.blur_tolerance,
             identify=request.identify,
             min_margin=request.min_margin,
+            model=request.model,
         )
     except RuntimeError as e:
         if "busy" in str(e).lower():
@@ -763,6 +776,7 @@ async def faces_identify_video(request: FaceVideoRequest):
                 track_max_gap_s=request.track_max_gap_s,
                 min_track_quality=request.min_track_quality,
                 min_margin=request.min_margin,
+                model=request.model,
                 include_crops=request.include_crops,
             )
         except ValueError as e:
@@ -777,6 +791,7 @@ async def faces_identify_video(request: FaceVideoRequest):
 
     return FaceVideoResponse(
         strategy=result["strategy"],
+        model=result.get("model", ""),
         people=[PersonSighting(**p) for p in result["people"]],
         tracks=[TrackResult(**t) for t in result["tracks"]],
         unknown_tracks=result["unknown_tracks"],
