@@ -65,6 +65,25 @@ TILE_OVERLAP = 0.2
 DEFAULT_MIN_FACE_PIXELS = 12000     # ~110x110; below this recognition degrades sharply
 DEFAULT_BLUR_TOLERANCE = 150.0      # variance of Laplacian
 
+# Quality floor for ENROLMENT. Calibrated against 143 verified faces and 400 verified
+# false positives (SCRFD reads a terracotta plant pot in the garden as a face):
+#
+#   floor   faces kept   pots kept   pot share of survivors
+#   0.05       100.0%      100.0%            73.7%   <- previous default
+#   0.20        61.5%       46.8%            68.0%
+#   0.25        53.8%       10.8%            35.8%
+#   0.30        36.4%        0.2%             1.9%   <- adopted
+#
+# At 0.05, three quarters of accepted "faces" were pottery. One in a gallery drags that
+# person's centroid toward a plant pot permanently, and nothing downstream can see it.
+# Losing 64% of real faces is an acceptable price: enrolment needs a handful of good
+# crops, not all of them.
+DEFAULT_ENROLL_QUALITY_FLOOR = 0.30
+
+# Identification is deliberately laxer. A false positive here just fails to match and
+# returns "unknown", which costs nothing; rejecting a real face costs a miss.
+DEFAULT_PROBE_QUALITY_FLOOR = 0.10
+
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
@@ -906,7 +925,8 @@ def analyze_image(image: Image.Image, min_confidence: float = 0.5,
 
 def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5,
                       source: Optional[str] = None,
-                      model: Optional[str] = None) -> dict:
+                      model: Optional[str] = None,
+                      min_quality: float = DEFAULT_ENROLL_QUALITY_FLOOR) -> dict:
     """Enroll the single largest face in an image under `name`.
 
     Deliberately refuses images containing more than one face: silently picking one
@@ -933,6 +953,14 @@ def enroll_from_image(name: str, image: Image.Image, min_confidence: float = 0.5
 
     quality = quality_score(face["area_px"], sharpness, face["confidence"],
                             frontality(face["landmarks"]))
+
+    if quality < min_quality:
+        raise ValueError(
+            f"Face quality {quality:.3f} is below the enrolment floor {min_quality:.2f}. "
+            "Detections this weak are frequently not faces at all - SCRFD reads garden "
+            "objects as faces at 0.13-0.25. Use a clearer image, or lower min_quality "
+            "deliberately if you have verified this crop."
+        )
 
     embedder, model_name = resolve_embedder(model)
     vector = embedder.embed(aligned)
